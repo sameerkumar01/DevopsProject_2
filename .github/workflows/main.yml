@@ -1,0 +1,102 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  security-events: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.6
+
+      # Run tfsec for Terraform scanning
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+          format: sarif
+          output: tfsec-results.sarif
+          soft_fail: true
+
+      # Upload tfsec results to GitHub Security
+      - name: Upload tfsec results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-results.sarif
+
+      # Build Docker image
+      - name: Build Docker image
+        run: docker build -t myapp:latest .
+
+      # Run Trivy for Docker image scanning
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: myapp:latest
+          format: sarif
+          exit-code: 0
+          severity: CRITICAL,HIGH
+          output: trivy-results.sarif
+
+      # Upload Trivy results to GitHub Security
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Install kubeseal for Sealed Secrets
+      - name: Install kubeseal
+        run: |
+          curl -L -o kubeseal https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.27.0/kubeseal-linux-amd64
+          sudo chmod +x kubeseal
+          sudo mv kubeseal /usr/local/bin/
+
+      # Create Sealed Secrets
+      - name: Create Sealed Secrets
+        run: |
+          kubeseal --fetch-cert > pub-cert.pem
+          kubeseal < k8s/secrets.yaml > k8s/sealed-secrets.yaml -o yaml
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+      # Set up kubectl
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      # Deploy to Kubernetes
+      - name: Deploy to Kubernetes
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" > kubeconfig.yaml
+          export KUBECONFIG=kubeconfig.yaml
+          kubectl apply -f k8s/sealed-secrets.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      # Apply Terraform configurations
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform/
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: terraform/
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
